@@ -146,7 +146,7 @@ class TestCompareModels(unittest.TestCase):
     def test_compare_models_evaluates_correct_costs(self):
         with patch.object(_m, "call_openai") as mock_openai, \
              patch.object(_m, "call_gemini") as mock_gemini:
-             
+
             # Setup mock returns
             mock_openai.side_effect = [
                 ("GPT-4o Response", 0.5, {"input_tokens": 10, "output_tokens": 20}),       # 1st call: gpt-4o
@@ -168,15 +168,33 @@ class TestCompareModels(unittest.TestCase):
             # Verify exact cost calculations
             # gpt-4o: (10 * 5.0 + 20 * 20.0) / 1,000,000 = 0.00045
             self.assertAlmostEqual(result["gpt4o"]["cost"], 0.00045, places=8)
-            
+
             # gpt-4o-mini: (10 * 0.150 + 20 * 0.600) / 1,000,000 = 0.0000135
             self.assertAlmostEqual(result["gpt4o_mini"]["cost"], 0.0000135, places=8)
-            
+
             # gemini-2.5-flash: (10 * 0.075 + 20 * 0.300) / 1,000,000 = 0.00000675
             self.assertAlmostEqual(result["gemini_flash"]["cost"], 0.00000675, places=8)
 
 
 class TestRetryWithBackoff(unittest.TestCase):
+
+    def test_backoff_delays_and_attempt_limit(self):
+        fn = MagicMock(side_effect=RuntimeError("failure"))
+        with patch.object(_m.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "failure"):
+                retry_with_backoff(fn, max_retries=3, base_delay=0.25)
+        self.assertEqual(fn.call_count, 4)
+        self.assertEqual(sleep.call_args_list, [
+            unittest.mock.call(0.25), unittest.mock.call(0.5), unittest.mock.call(1.0),
+        ])
+
+    def test_zero_retries_calls_once(self):
+        fn = MagicMock(side_effect=RuntimeError("failure"))
+        with patch.object(_m.time, "sleep") as sleep:
+            with self.assertRaises(RuntimeError):
+                retry_with_backoff(fn, max_retries=0)
+        fn.assert_called_once_with()
+        sleep.assert_not_called()
 
     def test_succeeds_immediately(self):
         val = retry_with_backoff(lambda: "success")
@@ -207,7 +225,7 @@ class TestBatchCompareAndFormat(unittest.TestCase):
 
     def test_batch_runs_and_formats_table(self):
         with patch.object(_m, "compare_models") as mock_comp:
-            def _get_mock():
+            def _get_mock(prompt):
                 return {
                     "gpt4o": {"response": "GPT-4o response content here", "latency": 0.5, "cost": 0.00045, "input_tokens": 10, "output_tokens": 20},
                     "gpt4o_mini": {"response": "GPT-4o-Mini response content here", "latency": 0.3, "cost": 0.0000135, "input_tokens": 10, "output_tokens": 20},
@@ -218,6 +236,7 @@ class TestBatchCompareAndFormat(unittest.TestCase):
             results = batch_compare(["Q1", "Q2"])
             self.assertEqual(len(results), 2)
             self.assertEqual(results[0]["prompt"], "Q1")
+            self.assertEqual(mock_comp.call_args_list, [unittest.mock.call("Q1"), unittest.mock.call("Q2")])
 
             table = format_comparison_table(results)
             self.assertIsInstance(table, str)
@@ -228,6 +247,43 @@ class TestBatchCompareAndFormat(unittest.TestCase):
 
 
 class TestStreamingChatbot(unittest.TestCase):
+
+    @patch("builtins.print")
+    @patch("builtins.input", side_effect=["one", "two", "three", "four", "five", "exit"])
+    @patch("google.genai.Client")
+    def test_streams_with_three_completed_turns(self, MockClient, mock_input, mock_print):
+        from types import SimpleNamespace
+
+        stream = MockClient.return_value.models.generate_content_stream
+        stream.side_effect = lambda **kwargs: iter([
+            SimpleNamespace(text=None),
+            SimpleNamespace(text="Hello "),
+            SimpleNamespace(text="world"),
+        ])
+
+        streaming_chatbot()
+
+        self.assertEqual(stream.call_count, 5)
+        requests = [call.kwargs["contents"] for call in stream.call_args_list]
+        self.assertEqual([len(contents) for contents in requests], [1, 3, 5, 7, 7])
+        self.assertEqual(requests[-1][0].parts[0].text, "two")
+        self.assertEqual(requests[-1][-1].parts[0].text, "five")
+        self.assertEqual(requests[-1][1].role, "model")
+        self.assertEqual(requests[-1][1].parts[0].text, "Hello world")
+        mock_print.assert_any_call("Hello ", end="", flush=True)
+
+    @patch("builtins.print")
+    @patch("builtins.input", side_effect=["failed", "next", "exit"])
+    @patch("google.genai.Client")
+    def test_failed_stream_is_not_added_to_history(self, MockClient, mock_input, mock_print):
+        from types import SimpleNamespace
+
+        stream = MockClient.return_value.models.generate_content_stream
+        stream.side_effect = [RuntimeError("temporary failure"), iter([SimpleNamespace(text="ok")])]
+        streaming_chatbot()
+        contents = stream.call_args_list[1].kwargs["contents"]
+        self.assertEqual(len(contents), 1)
+        self.assertEqual(contents[0].parts[0].text, "next")
 
     @patch("builtins.input", side_effect=["quit"])
     @patch("google.genai.Client")
